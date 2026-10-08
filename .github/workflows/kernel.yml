@@ -1,0 +1,257 @@
+name: Oppo A15 Kernel Merge & Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: "Oppo A15 kernel source URL (Git/ZIP/TAR)"
+        required: true
+        type: string
+      donor_url:
+        description: "Realme modified kernel source URL (optional)"
+        required: false
+        default: ""
+        type: string
+      extra_url:
+        description: "Optional ZIP/TAR URL containing missing files"
+        required: false
+        default: ""
+        type: string
+      kernel_name:
+        description: "Kernel name"
+        required: true
+        default: "11-A15-Kernel"
+        type: string
+      merge_mode:
+        description: "How donor/extra files are merged"
+        required: true
+        default: "missing-only"
+        type: choice
+        options:
+          - missing-only
+          - overlay
+      build_command:
+        description: "Optional custom build command"
+        required: false
+        default: ""
+        type: string
+      create_release:
+        description: "Create GitHub Release after successful build"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git curl unzip zip tar rsync file \
+            bc bison flex build-essential \
+            libssl-dev libelf-dev libncurses-dev \
+            device-tree-compiler \
+            clang llvm lld \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: Prepare workspace
+        run: |
+          rm -rf work artifacts
+          mkdir -p work/base work/donor work/extra work/kernel artifacts
+
+      - name: Download sources
+        env:
+          BASE_URL: ${{ inputs.base_url }}
+          DONOR_URL: ${{ inputs.donor_url }}
+          EXTRA_URL: ${{ inputs.extra_url }}
+        run: |
+          set -e
+
+          fetch_source() {
+            URL="$1"
+            DEST="$2"
+
+            [ -z "$URL" ] && return 0
+
+            mkdir -p "$DEST"
+            echo "Fetching: $URL"
+
+            if git ls-remote "$URL" HEAD >/dev/null 2>&1; then
+              git clone --depth=1 "$URL" "$DEST"
+            else
+              ARCHIVE="/tmp/source_archive_$RANDOM"
+              curl -L --fail --retry 3 -o "$ARCHIVE" "$URL"
+              file "$ARCHIVE"
+
+              if unzip -t "$ARCHIVE" >/dev/null 2>&1; then
+                unzip -q "$ARCHIVE" -d "$DEST"
+              elif tar -tf "$ARCHIVE" >/dev/null 2>&1; then
+                tar -xf "$ARCHIVE" -C "$DEST"
+              else
+                echo "ERROR: Unsupported source/archive: $URL"
+                exit 1
+              fi
+            fi
+
+            shopt -s dotglob nullglob
+            ITEMS=("$DEST"/*)
+
+            if [ "${#ITEMS[@]}" -eq 1 ] && [ -d "${ITEMS[0]}" ]; then
+              TEMP="${DEST}_tmp"
+              mv "${ITEMS[0]}" "$TEMP"
+              rm -rf "$DEST"
+              mv "$TEMP" "$DEST"
+            fi
+          }
+
+          fetch_source "$BASE_URL" work/base
+          fetch_source "$DONOR_URL" work/donor
+          fetch_source "$EXTRA_URL" work/extra
+
+      - name: Merge kernel sources
+        env:
+          MERGE_MODE: ${{ inputs.merge_mode }}
+        run: |
+          set -e
+
+          rsync -a --exclude='.git' work/base/ work/kernel/
+
+          REPORT="$GITHUB_WORKSPACE/artifacts/MERGE_REPORT.txt"
+          echo "Oppo A15 Kernel Merge Report" > "$REPORT"
+          echo "Mode: $MERGE_MODE" >> "$REPORT"
+          echo >> "$REPORT"
+
+          merge_tree() {
+            SRC="$1"
+
+            [ -d "$SRC" ] || return 0
+
+            cd "$SRC"
+
+            while IFS= read -r -d '' FILE; do
+              REL="${FILE#./}"
+              SOURCE_FILE="$SRC/$REL"
+              TARGET_FILE="$GITHUB_WORKSPACE/work/kernel/$REL"
+
+              if [ "$MERGE_MODE" = "overlay" ] || [ ! -e "$TARGET_FILE" ]; then
+                mkdir -p "$(dirname "$TARGET_FILE")"
+                cp -a "$SOURCE_FILE" "$TARGET_FILE"
+                echo "ADDED/OVERLAY: $REL" >> "$REPORT"
+              else
+                echo "KEPT: $REL" >> "$REPORT"
+              fi
+            done < <(
+              find . -type f \
+                -not -path './.git/*' \
+                -print0
+            )
+
+            cd "$GITHUB_WORKSPACE"
+          }
+
+          merge_tree work/donor
+          merge_tree work/extra
+
+      - name: Configure Oppo A15 kernel
+        run: |
+          set -e
+          cd work/kernel
+
+          if [ ! -f "arch/arm64/configs/oppo6765_defconfig" ] && \
+             [ ! -f "arch/arm/configs/oppo6765_defconfig" ]; then
+            echo "ERROR: oppo6765_defconfig was not found."
+            exit 1
+          fi
+
+          echo "Using fixed defconfig: oppo6765_defconfig"
+
+      - name: Build kernel
+        env:
+          CUSTOM_BUILD: ${{ inputs.build_command }}
+        run: |
+          set -e
+          cd work/kernel
+
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export LLVM=1
+          export LLVM_IAS=1
+          export CC=clang
+
+          if [ -n "$CUSTOM_BUILD" ]; then
+            echo "Running custom build command:"
+            echo "$CUSTOM_BUILD"
+
+            bash -lc "$CUSTOM_BUILD" \
+              2>&1 | tee "$GITHUB_WORKSPACE/artifacts/build.log"
+          else
+            make O=out oppo6765_defconfig \
+              2>&1 | tee "$GITHUB_WORKSPACE/artifacts/defconfig.log"
+
+            make -j"$(nproc)" O=out \
+              2>&1 | tee "$GITHUB_WORKSPACE/artifacts/build.log"
+          fi
+
+      - name: Collect kernel outputs
+        if: always()
+        env:
+          KERNEL_NAME: ${{ inputs.kernel_name }}
+        run: |
+          set +e
+
+          mkdir -p artifacts/kernel-output
+
+          find work/kernel/out -type f \
+            \( -name 'Image' \
+            -o -name 'Image.gz' \
+            -o -name 'Image.gz-dtb' \
+            -o -name 'zImage' \
+            -o -name '*.dtb' \
+            -o -name '*.dtbo' \) \
+            -exec cp --parents {} artifacts/kernel-output/ \;
+
+          echo "Kernel name: $KERNEL_NAME" > artifacts/build-info.txt
+          echo "Defconfig: oppo6765_defconfig" >> artifacts/build-info.txt
+          echo "Base source: ${{ inputs.base_url }}" >> artifacts/build-info.txt
+          echo "Donor source: ${{ inputs.donor_url }}" >> artifacts/build-info.txt
+          echo "Extra files: ${{ inputs.extra_url }}" >> artifacts/build-info.txt
+
+      - name: Package merged source
+        if: always()
+        env:
+          KERNEL_NAME: ${{ inputs.kernel_name }}
+        run: |
+          set +e
+          cd work
+          zip -qr "../artifacts/${KERNEL_NAME}-merged-source.zip" kernel
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.kernel_name }}
+          path: artifacts/
+          compression-level: 6
+          retention-days: 14
+
+      - name: Create GitHub Release
+        if: inputs.create_release && success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "${{ inputs.kernel_name }}-${{ github.run_number }}"
+          name: "${{ inputs.kernel_name }} Build ${{ github.run_number }}"
+          generate_release_notes: true
+          files: |
+            artifacts/${{ inputs.kernel_name }}-merged-source.zip
+            artifacts/kernel-output/**/*
+            artifacts/build-info.txt
