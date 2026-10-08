@@ -1,0 +1,171 @@
+name: Universal Kernel Merge Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: "Base kernel source URL (Git or ZIP)"
+        required: true
+        type: string
+      donor_url:
+        description: "Modified/donor source URL (optional)"
+        required: false
+        type: string
+      extra_url:
+        description: "Missing-files ZIP/TAR URL (optional)"
+        required: false
+        type: string
+      kernel_name:
+        description: "Kernel name"
+        required: true
+        default: "11-A15-Kernel"
+        type: string
+      defconfig:
+        description: "Defconfig, e.g. oppo6765_defconfig"
+        required: false
+        type: string
+      merge_mode:
+        description: "missing-only or overlay"
+        required: true
+        default: "missing-only"
+        type: choice
+        options:
+          - missing-only
+          - overlay
+      build_command:
+        description: "Optional custom build command"
+        required: false
+        type: string
+      create_release:
+        description: "Create GitHub Release"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git curl unzip zip tar rsync file bc bison flex build-essential libssl-dev libelf-dev libncurses-dev device-tree-compiler clang llvm lld gcc-aarch64-linux-gnu
+
+      - name: Prepare
+        run: |
+          rm -rf work artifacts
+          mkdir -p work/base work/donor work/extra work/kernel artifacts
+
+      - name: Download sources
+        env:
+          BASE: ${{ inputs.base_url }}
+          DONOR: ${{ inputs.donor_url }}
+          EXTRA: ${{ inputs.extra_url }}
+        run: |
+          set -e
+          fetch() {
+            url="$1"; dest="$2"
+            [ -z "$url" ] && return 0
+            mkdir -p "$dest"
+            if git ls-remote "$url" HEAD >/dev/null 2>&1; then
+              git clone --depth=1 "$url" "$dest"
+            else
+              a="/tmp/source.$RANDOM"
+              curl -L --fail --retry 3 -o "$a" "$url"
+              if unzip -t "$a" >/dev/null 2>&1; then unzip -q "$a" -d "$dest"
+              elif tar -tf "$a" >/dev/null 2>&1; then tar -xf "$a" -C "$dest"
+              else echo "Unsupported source: $url"; exit 1; fi
+            fi
+            shopt -s dotglob nullglob
+            x=("$dest"/*)
+            if [ "${#x[@]}" -eq 1 ] && [ -d "${x[0]}" ]; then
+              t="${dest}_tmp"; mv "${x[0]}" "$t"; rm -rf "$dest"; mv "$t" "$dest"
+            fi
+          }
+          fetch "$BASE" work/base
+          fetch "$DONOR" work/donor
+          fetch "$EXTRA" work/extra
+
+      - name: Merge sources
+        env:
+          MODE: ${{ inputs.merge_mode }}
+        run: |
+          set -e
+          rsync -a --exclude=.git work/base/ work/kernel/
+          echo "Merge report" > artifacts/MERGE_REPORT.txt
+          merge_tree() {
+            src="$1"; [ -d "$src" ] || return 0
+            cd "$src"
+            while IFS= read -r -d '' f; do
+              rel="${f#./}"; s="$src/$rel"; d="$GITHUB_WORKSPACE/work/kernel/$rel"
+              if [ "$MODE" = "overlay" ] || [ ! -e "$d" ]; then
+                mkdir -p "$(dirname "$d")"
+                cp -a "$s" "$d"
+                echo "ADDED/OVERLAY: $rel" >> "$GITHUB_WORKSPACE/artifacts/MERGE_REPORT.txt"
+              else
+                echo "KEPT: $rel" >> "$GITHUB_WORKSPACE/artifacts/MERGE_REPORT.txt"
+              fi
+            done < <(find . -type f -not -path './.git/*' -print0)
+            cd "$GITHUB_WORKSPACE"
+          }
+          merge_tree work/donor
+          merge_tree work/extra
+
+      - name: Select defconfig
+        env:
+          CFG: ${{ inputs.defconfig }}
+        run: |
+          set -e
+          cd work/kernel
+          if [ -n "$CFG" ]; then echo "DEFCONFIG=$CFG" >> "$GITHUB_ENV"; exit 0; fi
+          f="$(find arch/arm64/configs arch/arm/configs -type f \( -iname '*oppo*defconfig' -o -iname '*mt6765*defconfig' -o -iname '*2185*defconfig' \) 2>/dev/null | head -n1 || true)"
+          [ -n "$f" ] || f="$(find arch/arm64/configs arch/arm/configs -type f -name '*defconfig' 2>/dev/null | head -n1 || true)"
+          [ -n "$f" ] || { echo "No defconfig found. Enter it manually."; exit 1; }
+          echo "DEFCONFIG=$(basename "$f")" >> "$GITHUB_ENV"
+
+      - name: Build
+        env:
+          CUSTOM: ${{ inputs.build_command }}
+        run: |
+          set -e
+          cd work/kernel
+          export ARCH=arm64 SUBARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang
+          if [ -n "$CUSTOM" ]; then
+            bash -lc "$CUSTOM" 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/build.log"
+          else
+            make O=out "$DEFCONFIG" 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/defconfig.log"
+            make -j"$(nproc)" O=out 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/build.log"
+          fi
+
+      - name: Collect and package
+        if: always()
+        env:
+          NAME: ${{ inputs.kernel_name }}
+        run: |
+          set +e
+          mkdir -p artifacts/kernel-output
+          find work/kernel/out -type f \( -name Image -o -name Image.gz -o -name Image.gz-dtb -o -name zImage -o -name '*.dtb' -o -name '*.dtbo' \) -exec cp --parents {} artifacts/kernel-output/ \;
+          cd work
+          zip -qr "../artifacts/${NAME}-merged-source.zip" kernel
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.kernel_name }}
+          path: artifacts/
+          retention-days: 14
+
+      - name: Release
+        if: inputs.create_release && success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "${{ inputs.kernel_name }}-${{ github.run_number }}"
+          name: "${{ inputs.kernel_name }} Build ${{ github.run_number }}"
+          files: artifacts/${{ inputs.kernel_name }}-merged-source.zip
