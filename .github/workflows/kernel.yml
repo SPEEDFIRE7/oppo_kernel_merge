@@ -1,0 +1,204 @@
+name: Merge and Build Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: "Base kernel source URL (Git repository or ZIP)"
+        required: true
+        type: string
+      donor_url:
+        description: "Donor/modified kernel source URL (Git repository or ZIP)"
+        required: true
+        type: string
+      kernel_name:
+        description: "Kernel name"
+        required: true
+        default: "11-A15-Kernel"
+        type: string
+      build_command:
+        description: "Build command after merge (leave empty for automatic detection)"
+        required: false
+        default: ""
+        type: string
+      defconfig:
+        description: "Kernel defconfig (leave empty for automatic detection)"
+        required: false
+        default: ""
+        type: string
+      merge_mode:
+        description: "How donor files are handled"
+        required: true
+        default: "missing-only"
+        type: choice
+        options:
+          - missing-only
+          - missing-and-overlay
+      create_release:
+        description: "Create a GitHub Release with build artifacts"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  merge-build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git curl wget unzip zip rsync bc bison flex \
+            build-essential ccache libssl-dev \
+            libelf-dev libncurses5-dev libncurses-dev \
+            python3 python3-pip device-tree-compiler \
+            clang lld llvm gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: Prepare workspace
+        run: |
+          rm -rf work
+          mkdir -p work/base work/donor work/build
+          echo "KERNEL_NAME=${{ inputs.kernel_name }}" >> "$GITHUB_ENV"
+
+      - name: Download base source
+        env:
+          URL: ${{ inputs.base_url }}
+        run: |
+          set -e
+          chmod +x scripts/fetch-source.sh
+          scripts/fetch-source.sh "$URL" work/base
+
+      - name: Download donor source
+        env:
+          URL: ${{ inputs.donor_url }}
+        run: |
+          set -e
+          scripts/fetch-source.sh "$URL" work/donor
+
+      - name: Merge source trees
+        env:
+          MERGE_MODE: ${{ inputs.merge_mode }}
+        run: |
+          chmod +x scripts/merge-kernel.sh
+          scripts/merge-kernel.sh work/base work/donor work/build "$MERGE_MODE"
+
+      - name: Detect kernel configuration
+        env:
+          DEFCONFIG: ${{ inputs.defconfig }}
+        run: |
+          set -e
+          cd work/build
+
+          if [ -n "$DEFCONFIG" ]; then
+            echo "Using supplied defconfig: $DEFCONFIG"
+            echo "DEFCONFIG=$DEFCONFIG" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          found=""
+          for f in \
+            arch/arm64/configs/*defconfig \
+            arch/arm/configs/*defconfig \
+            arch/arm64/configs/vendor/*defconfig \
+            arch/arm/configs/vendor/*defconfig
+          do
+            [ -f "$f" ] || continue
+            case "$f" in
+              *mt6765*|*k65*|*oppo*|*2185*) found="$f"; break ;;
+            esac
+          done
+
+          if [ -z "$found" ]; then
+            found="$(find arch/arm64/configs arch/arm/configs -type f -name '*defconfig' 2>/dev/null | head -n1 || true)"
+          fi
+
+          if [ -z "$found" ]; then
+            echo "ERROR: No defconfig found."
+            exit 1
+          fi
+
+          cfg="$(basename "$found")"
+          echo "Auto-selected defconfig: $cfg"
+          echo "DEFCONFIG=$cfg" >> "$GITHUB_ENV"
+
+      - name: Build kernel
+        env:
+          BUILD_COMMAND: ${{ inputs.build_command }}
+        run: |
+          set -e
+          cd work/build
+
+          if [ -n "$BUILD_COMMAND" ]; then
+            echo "Running custom build command:"
+            echo "$BUILD_COMMAND"
+            bash -lc "$BUILD_COMMAND"
+            exit 0
+          fi
+
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export LLVM=1
+          export LLVM_IAS=1
+
+          if command -v clang >/dev/null 2>&1; then
+            export CC=clang
+          fi
+
+          make O=out "$DEFCONFIG"
+          make -j"$(nproc)" O=out
+
+      - name: Collect build information
+        if: always()
+        run: |
+          mkdir -p artifacts
+
+          cp -a work/build/. artifacts/merged-source 2>/dev/null || true
+
+          find work/build/out -type f \
+            \( -name 'Image' -o -name 'Image.gz' -o -name 'Image.gz-dtb' \
+            -o -name '*.dtb' -o -name '*.dtbo' -o -name 'zImage' \) \
+            -exec cp --parents {} artifacts/ \; 2>/dev/null || true
+
+          {
+            echo "Kernel name: $KERNEL_NAME"
+            echo "Defconfig: ${DEFCONFIG:-unknown}"
+            echo "Base URL: ${{ inputs.base_url }}"
+            echo "Donor URL: ${{ inputs.donor_url }}"
+            echo "Merge mode: ${{ inputs.merge_mode }}"
+            echo
+            echo "Git revision:"
+            git -C work/build rev-parse HEAD 2>/dev/null || true
+          } > artifacts/build-info.txt
+
+          find work -type f \( -name '*.log' -o -name 'build.log' \) \
+            -exec cp --parents {} artifacts/ \; 2>/dev/null || true
+
+      - name: Upload merged source and kernel
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.kernel_name }}
+          path: artifacts/
+          compression-level: 6
+          retention-days: 14
+
+      - name: Create release
+        if: inputs.create_release && success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.kernel_name }}-${{ github.run_number }}
+          name: "${{ inputs.kernel_name }} Build ${{ github.run_number }}"
+          generate_release_notes: true
+          files: |
+            artifacts/**/*.gz
+            artifacts/**/*.dtb
+            artifacts/**/*.dtbo
+            artifacts/build-info.txt
