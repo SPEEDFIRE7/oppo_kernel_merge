@@ -1,0 +1,699 @@
+name: Build Kernel 4.9 - Oppo A15 (Missing Files Detector)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_archive_url:
+        description: "اختياري: رابط أرشيف السورس (zip / tar / tar.gz / tar.xz) مثل PixelDrain. يجد جذر النواة تلقائياً حتى لو كان داخل مجلد. إن أدخلته يُتجاهل مستودع GitHub"
+        required: false
+        default: ""
+      kernel_repo:
+        description: "رابط المستودع"
+        required: true
+        default: "https://github.com/oppo-source/A15"
+      kernel_branch:
+        description: "الفرع"
+        required: true
+        default: "main"
+      kernel_subdir:
+        description: "مجلد النواة داخل المستودع (اتركه فارغاً إن كان في الجذر)"
+        required: false
+        default: "kernel-4.9"
+      defconfig:
+        description: "اسم ملف defconfig (مثال: xxx_defconfig)"
+        required: true
+      boot_img_url:
+        description: "رابط boot.img الأصلي (PixelDrain أو رابط مباشر) لبناء boot.img جديد. اتركه فارغاً لتخطيه"
+        required: false
+        default: ""
+      kernel_image:
+        description: "ملف النواة الذي يوضع داخل boot.img"
+        required: false
+        type: choice
+        options:
+          - Image.gz-dtb
+          - Image.gz
+          - Image
+        default: "Image.gz-dtb"
+      stub_undefined:
+        description: "إنشاء دوال/متغيرات وهمية للرموز غير المعرّفة (يعطّل ميزة Oppo الناقصة بدل إيقاف البناء)"
+        required: false
+        type: boolean
+        default: true
+      arch:
+        description: "المعمارية"
+        required: true
+        default: "arm64"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: توسيع المساحة
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: تثبيت الأدوات
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc bison flex libssl-dev libelf-dev \
+            libncurses-dev cpio python3 git ccache lz4 zstd device-tree-compiler \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi python2 gcc-9 file unzip zip
+
+      - name: جلب السورس
+        if: ${{ inputs.source_archive_url == '' }}
+        env:
+          IN_REPO: ${{ inputs.kernel_repo }}
+          IN_BRANCH: ${{ inputs.kernel_branch }}
+          IN_SUB: ${{ inputs.kernel_subdir }}
+        run: |
+          mkdir -p reports
+          REPO="${IN_REPO%/}"; BRANCH="$IN_BRANCH"; SUB="$IN_SUB"
+          # دعم لصق رابط tree/ كامل: يتم استخراج المستودع والفرع والمجلد تلقائياً
+          if [[ "$REPO" == */tree/* ]]; then
+            REST="${REPO#*/tree/}"
+            REPO="${REPO%%/tree/*}"
+            BRANCH="${REST%%/*}"
+            [[ "$REST" == */* ]] && SUB="${REST#*/}"
+          fi
+          echo "REPO=$REPO BRANCH=$BRANCH SUB=$SUB"
+          if [ -n "$SUB" ]; then
+            git clone --depth=1 --filter=blob:none --sparse -b "$BRANCH" "$REPO" repo
+            git -C repo sparse-checkout set "$SUB"
+            if [ ! -d "repo/$SUB" ]; then
+              echo "::error::المجلد $SUB غير موجود في المستودع"; ls repo; exit 1
+            fi
+            mv "repo/$SUB" kernel
+          else
+            git clone --depth=1 -b "$BRANCH" "$REPO" kernel
+          fi
+
+      - name: تنزيل السورس من أرشيف واستخراجه والتحقق منه
+        if: ${{ inputs.source_archive_url != '' }}
+        env:
+          SRC_URL: ${{ inputs.source_archive_url }}
+          DEFCONFIG: ${{ inputs.defconfig }}
+          ARCH_IN: ${{ inputs.arch }}
+        run: |
+          set -e
+          mkdir -p reports
+          URL="$SRC_URL"
+          if [[ "$URL" =~ pixeldrain\.com/u/([A-Za-z0-9_-]+) ]]; then
+            URL="https://pixeldrain.com/api/file/${BASH_REMATCH[1]}"
+          fi
+          echo "تنزيل الأرشيف من: $URL"
+          if [[ "$URL" == file://* ]]; then cp "${URL#file://}" source.bin; else curl -L --fail --retry 3 -o source.bin "$URL"; fi
+          ls -lh source.bin
+
+          extract() {   # $1 = ملف الأرشيف  $2 = مجلد الوجهة
+            local f="$1" d="$2" ft
+            ft=$(file -b "$f")
+            echo "نوع $(basename "$f"): $ft"
+            mkdir -p "$d"
+            case "$ft" in
+              Zip*)                                   unzip -q -o "$f" -d "$d" ;;
+              gzip*|bzip2*|XZ*|Zstandard*|POSIX\ tar*|tar\ archive*) tar -xf "$f" -C "$d" ;;
+              *) echo "::error::صيغة غير مدعومة: $ft (المدعوم: zip / tar / tar.gz / tar.xz / tar.bz2)"; return 1 ;;
+            esac
+          }
+
+          find_roots() {
+            find extracted -maxdepth 8 -type f -path '*/init/main.c' -not -path '*/.git/*' 2>/dev/null | while read -r f; do
+              d=$(dirname "$(dirname "$f")")
+              if [ -f "$d/Makefile" ] && [ -f "$d/Kconfig" ] && [ -d "$d/arch" ]; then echo "$d"; fi
+            done | awk '{print length($0) " " $0}' | sort -n | cut -d' ' -f2-
+          }
+
+          extract source.bin extracted
+          rm -f source.bin
+
+          ROOTS=$(find_roots || true)
+          # أرشيف داخل أرشيف (مثل zip يحوي tar.gz): نفك جولتين كحد أقصى
+          for pass in 1 2; do
+            [ -n "$ROOTS" ] && break
+            NESTED=$(find extracted -maxdepth 5 -type f \( -name '*.zip' -o -name '*.tar' -o -name '*.tar.gz' -o -name '*.tgz' -o -name '*.tar.xz' -o -name '*.tar.bz2' \) | head -n 10)
+            [ -n "$NESTED" ] || break
+            echo "تم العثور على أرشيفات داخلية، سيتم فكّها (جولة $pass):"; echo "$NESTED"
+            while read -r a; do
+              [ -n "$a" ] || continue
+              extract "$a" "$(dirname "$a")/_x_$(basename "$a")" || true
+              rm -f "$a"
+            done <<< "$NESTED"
+            ROOTS=$(find_roots || true)
+          done
+
+          if [ -z "$ROOTS" ]; then
+            echo "::error::لم أجد جذر النواة (مجلد فيه Makefile و Kconfig و init/main.c و arch/) داخل الأرشيف"
+            echo "محتوى المستوى الأعلى:"; ls -la extracted | head -n 30
+            exit 1
+          fi
+
+          echo "== المجلدات المرشحة لتكون جذر النواة =="
+          echo "$ROOTS"
+
+          ROOT=""
+          while read -r c; do
+            if [ -f "$c/arch/$ARCH_IN/configs/$DEFCONFIG" ]; then ROOT="$c"; break; fi
+          done <<< "$ROOTS"
+          if [ -z "$ROOT" ]; then
+            ROOT=$(echo "$ROOTS" | head -n1)
+            echo "تنبيه: لم يوجد $DEFCONFIG في أي مرشح، تم اختيار الأقرب للسطح: $ROOT"
+          fi
+          echo "الجذر المختار: $ROOT"
+
+          {
+            echo "== التحقق من السورس =="
+            echo "الجذر داخل الأرشيف: ${ROOT#extracted/}"
+            MISSING=0
+            for f in Makefile Kconfig init/main.c "arch/$ARCH_IN/Makefile" "arch/$ARCH_IN/Kconfig" "arch/$ARCH_IN/configs/$DEFCONFIG"; do
+              if [ -e "$ROOT/$f" ]; then echo "OK    $f"; else echo "MISS  $f"; MISSING=1; fi
+            done
+            VER=$(awk '/^VERSION/{v=$3}/^PATCHLEVEL/{p=$3}/^SUBLEVEL/{s=$3} END{print v"."p"."s}' "$ROOT/Makefile")
+            echo "إصدار النواة: $VER"
+            echo "عدد الملفات: $(find "$ROOT" -type f -not -path '*/.git/*' | wc -l)"
+            case "$VER" in 4.9.*) ;; *) echo "تنبيه: الإصدار ليس 4.9" ;; esac
+            if [ ! -e "$ROOT/arch/$ARCH_IN/configs/$DEFCONFIG" ]; then
+              echo "--- defconfig متوفرة تشبه المطلوب ---"
+              ls "$ROOT/arch/$ARCH_IN/configs/" 2>/dev/null | grep -i -E "oppo|6765|k65|rmx|realme|merged" | head -n 30
+            fi
+            echo "MISSING_CORE=$MISSING"
+          } | tee reports/SOURCE_CHECK.txt
+
+          if grep -q "^MISS  \(Makefile\|Kconfig\|init/main.c\|arch/$ARCH_IN/Makefile\|arch/$ARCH_IN/Kconfig\)" reports/SOURCE_CHECK.txt; then
+            echo "::error::ملفات أساسية ناقصة في السورس، راجع SOURCE_CHECK.txt"; exit 1
+          fi
+          if grep -q "^MISS  arch/$ARCH_IN/configs/$DEFCONFIG" reports/SOURCE_CHECK.txt; then
+            echo "::error::الملف $DEFCONFIG غير موجود. اختر اسماً من القائمة أعلاه وأعد التشغيل"; exit 1
+          fi
+
+          mv "$ROOT" kernel
+          rm -rf extracted
+          echo "تم تجهيز kernel/"
+
+      - name: تجهيز Python2 لأدوات MediaTek (DrvGen.py)
+        working-directory: kernel
+        run: |
+          sudo ln -sf /usr/bin/python2 /usr/local/bin/python
+          python --version || true
+          # أدوات DCT مكتوبة بـ Python 2: نثبّت المفسّر في السطر الأول
+          for f in tools/dct/*.py; do
+            [ -f "$f" ] && sed -i '1s|^#!.*python.*$|#!/usr/bin/python2|' "$f"
+          done
+          chmod +x tools/dct/*.py 2>/dev/null || true
+          head -n1 tools/dct/DrvGen.py 2>/dev/null || true
+
+      - name: ترقيع تعارض fw_entry (تعريف مكرر بين شاشة اللمس وWiFi)
+        working-directory: kernel
+        run: |
+          F=drivers/input/touchscreen/mediatek/NT36525B/nt36xxx_fw_update.c
+          [ -f "$F" ] || { echo "الملف غير موجود في هذا السورس، تخطي الترقيع"; exit 0; }
+          echo "--- قبل ---"; sed -n '40,44p' "$F"
+          grep -rn "fw_entry" drivers/input/touchscreen/mediatek/NT36525B/*.h || true
+          sed -i -E '42s/^([[:space:]]*)(const[[:space:]]+struct[[:space:]]+firmware[[:space:]]*\*[[:space:]]*fw_entry)/\1static \2/' "$F"
+          echo "--- بعد ---"; sed -n '40,44p' "$F"
+
+      - name: ترقيع kvmalloc (غير موجودة في نواة 4.9)
+        working-directory: kernel
+        run: |
+          mkdir -p ../patched_files
+          cat > ../kvfix.py <<'PY'
+          import os, re, shutil, subprocess
+
+          mm_h = "include/linux/mm.h"
+          util = "mm/util.c"
+          if not (os.path.exists(mm_h) and os.path.exists(util)):
+              print("mm.h/util.c not found, skipping")
+              raise SystemExit
+          h = open(mm_h, encoding="latin-1").read()
+          if re.search(r"\bkvmalloc\b", h):
+              print("kvmalloc already declared in mm.h, nothing to do")
+              raise SystemExit
+          used = subprocess.run(["grep", "-rlE", r"\bkvmalloc[[:space:]]*\(", "fs", "drivers", "net", "mm", "kernel", "--include=*.c", "--include=*.h"],
+                                capture_output=True, text=True).stdout.split()
+          if not used:
+              print("kvmalloc is not used anywhere, skipping")
+              raise SystemExit
+          print("kvmalloc used by:", used[:5])
+          decl = "extern void *kvmalloc(size_t size, gfp_t flags);"
+          anchor = "extern void kvfree(const void *addr);"
+          if anchor in h:
+              h = h.replace(anchor, anchor + "\n" + decl, 1)
+          else:
+              i = h.rfind("#endif")
+              h = h[:i] + decl + "\n" + h[i:]
+          open(mm_h, "w", encoding="latin-1").write(h)
+          u = open(util, encoding="latin-1").read()
+          u += '''
+          #include <linux/vmalloc.h>
+          /* compat: kvmalloc() does not exist in 4.9 (added in 4.12) */
+          void *kvmalloc(size_t size, gfp_t flags)
+          {
+          	void *p = kmalloc(size, flags | __GFP_NOWARN | __GFP_NORETRY);
+
+          	if (p)
+          		return p;
+          	return __vmalloc(size, flags | __GFP_HIGHMEM, PAGE_KERNEL);
+          }
+          EXPORT_SYMBOL(kvmalloc);
+          '''
+          open(util, "w", encoding="latin-1").write(u)
+          for rel in (mm_h, util):
+              dst = os.path.join("..", "patched_files", rel)
+              os.makedirs(os.path.dirname(dst), exist_ok=True)
+              shutil.copy2(rel, dst)
+          print("kvmalloc compat added to mm.h and mm/util.c")
+          PY
+          python3 ../kvfix.py
+
+      # ---------- المرحلة 1: فحص الملفات الأساسية ----------
+      - name: فحص الملفات الأساسية
+        working-directory: kernel
+        run: |
+          R=../reports/01_core_missing.txt
+          : > "$R"
+          ARCH="${{ inputs.arch }}"
+          for f in Makefile Kconfig init/main.c "arch/$ARCH/Makefile" "arch/$ARCH/Kconfig" \
+                   "arch/$ARCH/configs/${{ inputs.defconfig }}" scripts/kconfig/Makefile; do
+            [ -e "$f" ] || echo "MISSING_CORE: $f" >> "$R"
+          done
+          if [ ! -e "arch/$ARCH/configs/${{ inputs.defconfig }}" ]; then
+            echo "--- defconfigs المتوفرة في السورس ---" >> "$R"
+            ls "arch/$ARCH/configs/" 2>/dev/null >> "$R" || echo "(المجلد غير موجود)" >> "$R"
+          fi
+          cat "$R"
+
+      # ---------- المرحلة 2: توليد .config ----------
+      - name: make defconfig
+        working-directory: kernel
+        continue-on-error: true
+        run: |
+          export ARCH=${{ inputs.arch }} CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          make O=out HOSTCC=gcc-9 ${{ inputs.defconfig }} 2>&1 | tee ../reports/02_defconfig.log
+
+      # ---------- المرحلة 3: فحص Kconfig و Makefile ----------
+      - name: فحص Kconfig و Makefile (ملفات مفقودة)
+        working-directory: kernel
+        continue-on-error: true
+        run: |
+          python3 - <<'PY'
+          import os, re
+
+          cfg = {}
+          p = "out/.config"
+          if os.path.exists(p):
+              for l in open(p, errors="ignore"):
+                  m = re.match(r"(CONFIG_\w+)=([ym])", l)
+                  if m: cfg[m.group(1)] = m.group(2)
+          have_cfg = bool(cfg)
+
+          missing_kconfig, missing_objs, missing_dirs = [], [], []
+
+          for root, dirs, files in os.walk("."):
+              if root.startswith("./out") or "/.git" in root:
+                  continue
+
+              # --- Kconfig: source "path" ---
+              for f in files:
+                  if f.startswith("Kconfig"):
+                      fp = os.path.join(root, f)
+                      for l in open(fp, errors="ignore"):
+                          m = re.match(r'\s*source\s+"?([^"\s]+)"?', l)
+                          if m and "$" not in m.group(1):
+                              if not os.path.exists(m.group(1)):
+                                  missing_kconfig.append(f"{fp} -> {m.group(1)}")
+
+              # --- Makefile: obj-y / obj-m ---
+              for mk in ("Makefile", "Kbuild"):
+                  if mk not in files:
+                      continue
+                  fp = os.path.join(root, mk)
+                  txt = open(fp, errors="ignore").read().replace("\\\n", " ")
+                  composites = set(re.findall(r"^([\w\-]+)-(?:objs|y|m)\s*[:+]?=", txt, re.M))
+                  for m in re.finditer(r"^obj-(y|m|\$\((CONFIG_\w+)\))\s*[:+]?=\s*(.*)$", txt, re.M):
+                      sym = m.group(2)
+                      if sym and have_cfg and sym not in cfg:
+                          continue  # غير مفعّل في defconfig
+                      for tok in m.group(3).split("#")[0].split():
+                          if "$" in tok:
+                              continue
+                          if tok.endswith("/"):
+                              if not os.path.isdir(os.path.join(root, tok)):
+                                  missing_dirs.append(f"{fp} -> {tok}")
+                          elif tok.endswith(".o"):
+                              base = tok[:-2]
+                              if base in composites:
+                                  continue
+                              if not any(os.path.exists(os.path.join(root, base + e))
+                                         for e in (".c", ".S", ".s", ".o_shipped", ".c_shipped")):
+                                  missing_objs.append(f"{fp} -> {base}.c (أو .S)")
+
+          with open("../reports/03_static_missing.txt", "w") as o:
+              o.write("== Kconfig: ملفات source مفقودة ==\n" + "\n".join(sorted(set(missing_kconfig))) + "\n\n")
+              o.write("== Makefile: مجلدات مفقودة ==\n" + "\n".join(sorted(set(missing_dirs))) + "\n\n")
+              o.write("== Makefile: ملفات مصدرية مفقودة ==\n" + "\n".join(sorted(set(missing_objs))) + "\n")
+              if not have_cfg:
+                  o.write("\n[تنبيه] لم يتم توليد .config، لذلك تم فحص كل الخيارات (قد تظهر نتائج زائدة).\n")
+          print(open("../reports/03_static_missing.txt").read())
+          PY
+
+      # ---------- المرحلة 4: البناء مع -k لجمع كل الأخطاء ----------
+      - name: بناء النواة (يكمل رغم الأخطاء)
+        working-directory: kernel
+        continue-on-error: true
+        run: |
+          export ARCH=${{ inputs.arch }} CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          [ -f out/.config ] || make O=out HOSTCC=gcc-9 ${{ inputs.defconfig }} || true
+          make O=out HOSTCC=gcc-9 -k -j$(nproc) 2>&1 | tee ../reports/04_build.log
+
+      # ---------- المرحلة 5: استخراج الملفات المفقودة من لوج البناء ----------
+      # ---------- المرحلة 4ب: ترقيع تعارضات الربط (multiple definition) تلقائياً ----------
+      - name: ترقيع تعارضات الربط وإعادة الربط
+        continue-on-error: true
+        env:
+          ARCH_IN: ${{ inputs.arch }}
+          STUB_UNDEFINED: ${{ inputs.stub_undefined }}
+        run: |
+          cat > linkfix.py <<'PY'
+          import os, re, shutil, subprocess
+
+          K = os.path.abspath("kernel")
+          REP = os.path.abspath("reports")
+          PATCHED = os.path.abspath("patched_files")
+          LOG = os.path.join(REP, "05_link_fix.log")
+          DIAG = os.path.join(REP, "07_undefined_symbols.txt")
+          STUB_ON = os.environ.get("STUB_UNDEFINED", "true") == "true"
+          ENV = dict(os.environ, ARCH=os.environ.get("ARCH_IN", "arm64"),
+                     CROSS_COMPILE="aarch64-linux-gnu-", CROSS_COMPILE_ARM32="arm-linux-gnueabi-")
+          PAT = re.compile(r"(\S+?\.c):(\d+): multiple definition of `(\w+)'; \S+?:(\S+?\.c):(\d+): first defined here")
+          UND = re.compile(r"undefined reference to `(\w+)'")
+          STUB_REL = "drivers/misc/mediatek/mtk_undef_stubs.c"
+          STUB_MK = "drivers/misc/mediatek/Makefile"
+          RET_OK = {"void", "int", "long", "short", "char", "unsigned", "signed", "bool", "u8", "u16", "u32",
+                    "u64", "s8", "s16", "s32", "s64", "size_t", "ssize_t", "ulong", "uint", "const", "static",
+                    "inline", "__u8", "__u16", "__u32", "__u64"}
+          STUBS = {}
+
+
+          def log(m):
+              print(m, flush=True)
+              with open(LOG, "a") as f:
+                  f.write(m + "\n")
+
+
+          def norm(p):
+              return p.split("out/../")[-1]
+
+
+          def save_patched(rel):
+              dst = os.path.join(PATCHED, rel)
+              os.makedirs(os.path.dirname(dst), exist_ok=True)
+              shutil.copy2(os.path.join(K, rel), dst)
+
+
+          def extern_use(sym):
+              r = subprocess.run(["grep", "-rnE", r"extern[^;]*\b%s\b" % sym, "--include=*.h", "--include=*.c", "."],
+                                 cwd=K, capture_output=True, text=True, errors="replace")
+              return r.stdout.strip()
+
+
+          def make_static(rel, line, sym):
+              fp = os.path.join(K, rel)
+              if not os.path.exists(fp):
+                  return False
+              L = open(fp, encoding="latin-1").read().split("\n")
+              s = L[line - 1]
+              if sym not in s or re.match(r"\s*(static|extern)\b", s):
+                  return False
+              L[line - 1] = re.sub(r"^(\s*)", r"\1static ", s, count=1)
+              open(fp, "w", encoding="latin-1").write("\n".join(L))
+              save_patched(rel)
+              log("PATCHED: %s:%d  [%s]  ->  %s" % (rel, line, sym, L[line - 1].strip()))
+              return True
+
+
+          def walk_sources(exts):
+              for root, dirs, files in os.walk(K):
+                  rr = os.path.relpath(root, K)
+                  dirs[:] = [d for d in dirs if d not in (".git", "out", "Documentation", "tools")]
+                  if rr == "arch":
+                      dirs[:] = [d for d in dirs if d in ("arm64", "arm")]
+                  for f in files:
+                      if f.endswith(exts):
+                          yield os.path.join(root, f)
+
+
+          def diagnose(syms):
+              hits = {s: ([], []) for s in syms}
+              words = {s: re.compile(r"\b%s\b" % re.escape(s)) for s in syms}
+              for fp in walk_sources((".h", ".c")):
+                  try:
+                      txt = open(fp, encoding="latin-1").read()
+                  except OSError:
+                      continue
+                  if not any(s in txt for s in syms):
+                      continue
+                  rel = os.path.relpath(fp, K)
+                  for n, line in enumerate(txt.split("\n"), 1):
+                      for s in syms:
+                          if s in line and words[s].search(line):
+                              bucket = hits[s][0] if fp.endswith(".h") else hits[s][1]
+                              if len(bucket) < 6:
+                                  bucket.append("%s:%d: %s" % (rel, n, line.strip()[:140]))
+              with open(DIAG, "w") as o:
+                  for s in syms:
+                      o.write("=== %s ===\n-- headers --\n%s\n-- sources --\n%s\n\n" % (
+                          s, "\n".join(hits[s][0]) or "(none)", "\n".join(hits[s][1]) or "(none)"))
+              log("INFO: wrote 07_undefined_symbols.txt for %d symbols" % len(syms))
+
+
+          def build_stub(sym, text, need_extern=False):
+              var = re.search(r"^[ \t]*extern[ \t]+(?P<t>(?:[A-Za-z_]\w*[\s\*]+)+?)%s[ \t]*(?P<a>(?:\[[^\]]*\])*)[ \t]*;" % re.escape(sym), text, re.M)
+              if var:
+                  t = " ".join(var.group("t").split())
+                  return "%s %s%s;" % (t, sym, var.group("a"))
+              ext = r"extern[ \t]+" if need_extern else r"(?:extern[ \t]+)?"
+              fn = re.search(r"^[ \t]*" + ext + r"(?P<r>(?:[A-Za-z_]\w*[\s\*]+)+?)%s[ \t]*\((?P<p>[^;{}()]*)\)[ \t]*;" % re.escape(sym), text, re.M)
+              if not fn:
+                  return None
+              ret = " ".join(fn.group("r").split()).replace("extern ", "")
+              params = " ".join(fn.group("p").split())
+              if params in ("", "void"):
+                  params = "void"
+              else:
+                  for prm in params.split(","):
+                      if not re.search(r"[A-Za-z_]\w*\s*(\[[^\]]*\])?$", prm.strip()) or len(re.findall(r"[A-Za-z_]\w*|\*", prm)) < 2:
+                          return None
+                      last = re.findall(r"[A-Za-z_]\w*", prm)[-1]
+                      if last in RET_OK or last in ("struct", "enum"):
+                          return None
+              toks = re.findall(r"[A-Za-z_]\w*", ret)
+              if "*" in ret:
+                  body = "return NULL;"
+              elif toks and all(t in RET_OK for t in toks):
+                  body = "" if toks[-1] == "void" else ("return false;" if "bool" in toks else "return 0;")
+              else:
+                  return None
+              return "%s %s(%s) { %s }" % (ret, sym, params, body)
+
+
+          def make_stubs(syms):
+              pending = set(x for x in syms if x not in STUBS)
+              if not pending:
+                  return False
+              added = False
+              # 1) تصريحات في ملفات الرؤوس .h
+              for fp in walk_sources((".h",)):
+                  try:
+                      txt = open(fp, encoding="latin-1").read()
+                  except OSError:
+                      continue
+                  for x in list(pending):
+                      if x in txt:
+                          code = build_stub(x, txt)
+                          if code:
+                              STUBS[x] = (fp, code)
+                              pending.discard(x)
+                              added = True
+              # 2) تصريحات extern داخل ملفات .c نفسها (شائع في سورس Oppo/MTK)
+              if pending:
+                  for fp in walk_sources((".c",)):
+                      try:
+                          txt = open(fp, encoding="latin-1").read()
+                      except OSError:
+                          continue
+                      for x in list(pending):
+                          if x in txt and "extern" in txt:
+                              code = build_stub(x, txt, need_extern=True)
+                              if code:
+                                  STUBS[x] = (None, code)
+                                  pending.discard(x)
+                                  added = True
+              for x in sorted(pending):
+                  log("STUBFAIL: could not auto-generate a stub for %s (see 07_undefined_symbols.txt)" % x)
+              if not added:
+                  return False
+              sp = os.path.join(K, STUB_REL)
+              sdir = os.path.dirname(sp)
+              inc = sorted(set(os.path.relpath(h, sdir) for h, _ in STUBS.values() if h))
+              with open(sp, "w", encoding="latin-1") as o:
+                  o.write("/* AUTO-GENERATED stubs for symbols missing from the source (behaviour disabled) */\n")
+                  o.write("#include <linux/kernel.h>\n")
+                  for h in inc:
+                      o.write('#include "%s"\n' % h)
+                  o.write("\n")
+                  for x, (h, code) in sorted(STUBS.items()):
+                      o.write(code + "\n")
+              mk = os.path.join(K, STUB_MK)
+              mt = open(mk, encoding="latin-1").read()
+              if "mtk_undef_stubs.o" not in mt:
+                  with open(mk, "a", encoding="latin-1") as f:
+                      f.write("\nobj-y += mtk_undef_stubs.o\n")
+              save_patched(STUB_REL)
+              save_patched(STUB_MK)
+              for x in syms:
+                  if x in STUBS:
+                      log("STUB: %s -> %s" % (x, STUBS[x][1]))
+              return True
+
+
+          for i in range(1, 21):
+              log("INFO: link round %d" % i)
+              p = subprocess.run(["make", "O=out", "HOSTCC=gcc-9", "-j%d" % (os.cpu_count() or 2)],
+                                 cwd=K, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 text=True, errors="replace")
+              txt = p.stdout
+              open(os.path.join(REP, "06_last_link.log"), "w").write(txt)
+              if p.returncode == 0:
+                  log("INFO: build + link SUCCEEDED")
+                  break
+              changed = False
+              for f1, l1, sym, f2, l2 in PAT.findall(txt):
+                  ex = extern_use(sym)
+                  if ex:
+                      log("SKIP: %s is used with extern elsewhere, patch manually: %s" % (sym, ex.split("\n")[0]))
+                      continue
+                  for rel, ln in ((norm(f1), int(l1)), (norm(f2), int(l2))):
+                      if make_static(rel, ln, sym):
+                          changed = True
+                          break
+              syms = sorted(set(UND.findall(txt)))
+              if syms:
+                  diagnose(syms)
+                  if STUB_ON and make_stubs(syms):
+                      changed = True
+              if not changed:
+                  log("INFO: stopped; remaining error is not auto-fixable. see 06_last_link.log")
+                  log("TAIL: " + " | ".join(txt.strip().split("\n")[-6:])[:1500])
+                  break
+          PY
+          python3 linkfix.py
+
+      - name: تجميع تقرير الملفات المفقودة
+        if: always()
+        run: |
+          mkdir -p reports
+          L=reports/04_build.log
+          F=reports/MISSING_FILES_REPORT.txt
+          {
+            echo "########## تقرير الملفات الناقصة ##########"
+            echo
+            echo "== 1) ملفات أساسية مفقودة =="
+            cat reports/01_core_missing.txt 2>/dev/null
+            echo
+            echo "== 2) فحص ثابت (Kconfig/Makefile) =="
+            cat reports/03_static_missing.txt 2>/dev/null
+            echo
+            echo "== 3) ملفات Header مفقودة (من البناء) =="
+            grep -oE "fatal error: [^:]+: No such file or directory" "$L" 2>/dev/null | sort | uniq -c | sort -rn
+            echo
+            echo "== 4) 'No rule to make target' (ملف مفقود أو تبعية ناقصة) =="
+            grep -oE "No rule to make target '[^']+'" "$L" 2>/dev/null | sort -u
+            echo
+            echo "== 5) ملفات أخرى مفقودة =="
+            grep -E "No such file or directory|cannot find|can't open|Cannot open" "$L" 2>/dev/null \
+              | grep -v "fatal error" | sort -u | head -n 200
+            echo
+            echo "== 6) رموز غير معرّفة (undefined reference) =="
+            grep -oE "undefined reference to \`[^']+'" "$L" 2>/dev/null | sort | uniq -c | sort -rn | head -n 100
+            echo
+            echo "== 7) أول 50 خطأ بناء =="
+            grep -E "error:|Error [0-9]" "$L" 2>/dev/null | head -n 50
+          } > "$F"
+          cat "$F"
+          cat "$F" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: بناء boot.img جديد بالنواة المبنية
+        if: ${{ always() && inputs.boot_img_url != '' }}
+        continue-on-error: true
+        env:
+          BOOT_URL: ${{ inputs.boot_img_url }}
+          KIMG: ${{ inputs.kernel_image }}
+          ARCH_IN: ${{ inputs.arch }}
+        run: |
+          mkdir -p bootwork && cd bootwork
+          KFILE="../kernel/out/arch/${ARCH_IN}/boot/${KIMG}"
+          [ -f "$KFILE" ] || { echo "::error::لا يوجد $KIMG، النواة لم تُبنَ"; exit 1; }
+          URL="$BOOT_URL"
+          if [[ "$URL" =~ pixeldrain\.com/u/([A-Za-z0-9_-]+) ]]; then
+            URL="https://pixeldrain.com/api/file/${BASH_REMATCH[1]}"
+          fi
+          echo "تحميل boot.img من: $URL"
+          curl -L --fail --retry 3 -o boot.img "$URL"
+          ls -l boot.img; file boot.img
+          # أداة magiskboot تتعامل مع ترويسة MediaTek عند إعادة التجميع
+          curl -L --fail --retry 3 -o magisk.apk https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk
+          unzip -o -j magisk.apk lib/x86_64/libmagiskboot.so -d .
+          mv libmagiskboot.so magiskboot && chmod +x magiskboot
+          ./magiskboot unpack boot.img 2>&1 | tee unpack.log
+          ls -l
+          cp "$KFILE" kernel
+          ./magiskboot repack boot.img new-boot.img 2>&1 | tee repack.log
+          ls -l boot.img new-boot.img
+          mkdir -p ../bootout
+          cp new-boot.img unpack.log repack.log ../bootout/
+
+      - name: رفع boot.img الجديد
+        if: ${{ always() && inputs.boot_img_url != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: new-boot-img
+          path: bootout/
+          if-no-files-found: ignore
+
+      - name: رفع التقارير
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: missing-files-report
+          path: reports/
+
+      - name: رفع الملفات المرقّعة (طبّقها على سورسك لتدوم)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-files
+          path: patched_files/
+          if-no-files-found: ignore
+
+      - name: رفع النواة (إن نجح البناء)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-output
+          path: |
+            kernel/out/arch/${{ inputs.arch }}/boot/Image*
+            kernel/out/arch/${{ inputs.arch }}/boot/dts/**/*.dtb
+          if-no-files-found: ignore
+
+      - name: التحقق من النتيجة (يفشل إن لم تُبنَ النواة)
+        if: always()
+        run: |
+          if ls kernel/out/arch/${{ inputs.arch }}/boot/Image* >/dev/null 2>&1; then
+            echo "تم بناء النواة بنجاح"
+          else
+            echo "::error::لم تُنتج صورة النواة. افتح تقرير missing-files-report لمعرفة السبب"
+            exit 1
+          fi
